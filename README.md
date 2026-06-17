@@ -182,6 +182,32 @@ The hook script handles everything: it writes state files for cross-session visi
 
 > **Note:** The hooks fire on tool use events. Plain text responses (no tool calls) and "thinking" time don't trigger hooks, so the sidebar only reflects tool-based activity.
 
+### Setting up OpenCode hooks
+
+OpenCode integrates via its plugin system. The repo provides a native plugin that maps OpenCode events to sidebar state — no external dependencies.
+
+1. Copy the hook script and plugin to your OpenCode config:
+
+```bash
+mkdir -p ~/.config/opencode/hooks ~/.config/opencode/plugins
+cp scripts/opencode-sidebar.sh ~/.config/opencode/hooks/
+cp scripts/opencode-sidebar.ts ~/.config/opencode/plugins/
+chmod +x ~/.config/opencode/hooks/opencode-sidebar.sh
+```
+
+2. Restart opencode. The plugin auto-discovers from `~/.config/opencode/plugins/`. If it doesn't appear, register it explicitly in `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-sidebar"]
+}
+```
+
+The plugin handles everything: it writes state files for cross-session visibility and sends pipe messages for instant current-session updates. It also tracks turn duration so you can see how long OpenCode worked.
+
+> **Note:** The plugin hooks fire on tool use events. Plain text responses (no tool calls) and "thinking" time don't trigger hooks, so the sidebar only reflects tool-based activity.
+
 ### Other AI tools
 
 Any tool can integrate — just write to the shared state directory:

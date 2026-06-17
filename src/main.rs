@@ -840,8 +840,8 @@ layout {
         // Staleness is handled by SKIPPING, never deleting:
         //   - Session not currently known -> skip + evict in-memory (consistent
         //     every tick, so no flicker).
-        //   - `active` turn older than STALE_SECS (missed Stop) -> skip the pane.
-        const STALE_SECS: u64 = 1800; // 30m
+        //   - Any turn older than STALE_SECS (crashed/killed session) -> skip the pane.
+        const STALE_SECS: u64 = 900; // 15m
 
         let now = self.now_secs();
 
@@ -860,15 +860,6 @@ layout {
                 None => continue,
             };
             let path = session_entry.path();
-
-            // Session no longer exists as a zellij session. Only enforce once we
-            // have session data — at startup cached_statuses is empty and we must
-            // not wipe restored state. Skip (don't honor) + drop in-memory; never
-            // delete the file (another instance with a complete view may need it).
-            if self.has_session_data && !self.cached_statuses.contains_key(&session) {
-                self.evict_ai_session(&session);
-                continue;
-            }
 
             sessions_seen.insert(session.clone());
 
@@ -902,11 +893,9 @@ layout {
                     let ts = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
                     let dur = parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
 
-                    // An active turn that never closed (missed Stop). Ignore the
+                    // Stale state (crashed/killed session, missed hook). Ignore the
                     // pane; the hook cleans the file on SessionEnd.
-                    if matches!(state, AgentState::Active)
-                        && ts > 0 && now.saturating_sub(ts) > STALE_SECS
-                    {
+                    if ts > 0 && now.saturating_sub(ts) > STALE_SECS {
                         continue;
                     }
 
@@ -974,8 +963,12 @@ layout {
                 Some("waiting") => AgentState::Waiting,
                 _ => return,
             };
+            let ts = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            if ts > 0 && self.now_secs().saturating_sub(ts) > 900 {
+                return; // stale
+            }
             self.ai_states.insert(session.to_string(), state);
-            if let Some(ts) = parts.get(1).and_then(|s| s.parse::<u64>().ok()) {
+            if ts > 0 {
                 self.ai_state_since.insert(session.to_string(), ts);
             }
             if let Some(dur) = parts.get(2).and_then(|s| s.parse::<u64>().ok()) {
@@ -1275,10 +1268,10 @@ impl ZellijPlugin for State {
                             project.status = SessionStatus::NotStarted;
                         }
                     }
-                    // Prune stale AI states for sessions that no longer exist
-                    let active_session_names: BTreeSet<String> = sessions.iter().map(|s| s.name.clone()).collect();
-                    let resurrectable_names: BTreeSet<String> = resurrectable.iter().map(|(n, _)| n.clone()).collect();
-                    self.ai_states.retain(|name, _| active_session_names.contains(name) || resurrectable_names.contains(name));
+                    // NOTE: do not prune ai_states here. SessionUpdate is occasionally
+                    // incomplete (lists only the current session), which would drop other
+                    // sessions' AI state and cause flicker. load_ai_states owns AI-state
+                    // eviction (session-gone is reconciled there against the shared files).
                     self.initial_load_complete = true;
                 }
                 // Auto-track current session when sidebar is not actively navigated
