@@ -806,6 +806,11 @@ layout {
         // Read per-pane files: /tmp/sidebar-ai/<session>/<pane_id>
         // Each file: "state timestamp [duration]"
         // Aggregate per session: hottest state wins, count active panes
+        //
+        // Sessions found in files are authoritative. In-memory Active states
+        // with no backing file get evicted to prevent stale "claude · Xh".
+        let mut sessions_seen = std::collections::BTreeSet::new();
+
         if let Ok(sessions) = std::fs::read_dir("/tmp/sidebar-ai") {
             for session_entry in sessions.flatten() {
                 let session = match session_entry.file_name().to_str().map(|s| s.to_string()) {
@@ -813,6 +818,7 @@ layout {
                     None => continue,
                 };
                 let path = session_entry.path();
+                sessions_seen.insert(session.clone());
 
                 // Handle both old format (session is a file) and new format (session is a dir)
                 if path.is_file() {
@@ -877,6 +883,20 @@ layout {
                     }
                 }
             }
+        }
+
+        // Evict stale in-memory Active states not confirmed by files.
+        // Pipe messages set Active immediately; files are the persistent truth.
+        // Without this, a missed Stop/idle pipe leaves sessions stuck at "Active Xh".
+        let stale: Vec<String> = self.ai_states.iter()
+            .filter(|(session, state)| {
+                matches!(state, AgentState::Active) && !sessions_seen.contains(*session)
+            })
+            .map(|(s, _)| s.clone())
+            .collect();
+        for session in stale {
+            self.ai_states.remove(&session);
+            self.ai_pane_count.remove(&session);
         }
     }
 
