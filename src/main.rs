@@ -122,6 +122,7 @@ struct State {
     // Discovery mode
     scan_dir: Option<String>,
     use_discovery: bool,
+    sidebar_plugin_path: String,
     discovered_dirs: Vec<(String, String)>,
     scan_complete: bool,
     has_session_data: bool,
@@ -165,6 +166,7 @@ impl Default for State {
             browse_mode: false,
             scan_dir: None,
             use_discovery: false,
+            sidebar_plugin_path: "file:~/.config/zellij/plugins/zellij-project-sidebar.wasm".to_string(),
             discovered_dirs: Vec::new(),
             scan_complete: false,
             has_session_data: false,
@@ -340,6 +342,7 @@ keybinds {{
     fn create_tab_with_sidebar(&self) {
         let scan_dir = self.scan_dir.as_deref().unwrap_or("");
         let session_layout = self.session_layout.as_deref().unwrap_or("");
+        let plugin_path = &self.sidebar_plugin_path;
 
         let layout = if self.use_discovery {
             format!(
@@ -350,20 +353,17 @@ layout {{
     }}
     pane split_direction="vertical" {{
         pane size="15%" name="Projects" {{
-            plugin location="file:~/.config/zellij/plugins/zellij-project-sidebar.wasm" {{
+            plugin location="{plugin_path}" {{
                 scan_dir "{scan_dir}"
                 session_layout "{session_layout}"
+                sidebar_plugin_path "{plugin_path}"
                 is_primary "false"
             }}
         }}
         pane
     }}
-    pane size=1 borderless=true {{
-        plugin location="file:~/.config/zellij/plugins/zellij-attention.wasm" {{
-            enabled "true"
-            waiting_icon "⏳"
-            completed_icon "✅"
-        }}
+    pane size=2 borderless=true {{
+        plugin location="zellij:status-bar"
     }}
 }}
 "#
@@ -1003,6 +1003,13 @@ impl ZellijPlugin for State {
         self.session_layout = configuration.get("session_layout").cloned();
         self.is_primary = configuration.get("is_primary").map(|v| v != "false").unwrap_or(true);
         self.use_discovery = self.scan_dir.is_some();
+        if let Some(p) = configuration.get("sidebar_plugin_path") {
+            self.sidebar_plugin_path = p.clone();
+        }
+        // Default to browse mode when scan_dir is set so projects are visible immediately.
+        if self.scan_dir.is_some() {
+            self.browse_mode = true;
+        }
 
         if self.use_discovery {
             eprintln!("Discovery mode: scan_dir={:?}", self.scan_dir);
