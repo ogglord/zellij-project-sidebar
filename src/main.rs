@@ -198,14 +198,11 @@ fn extract_active_command(session: &SessionInfo) -> Option<String> {
                     panes.iter()
                         .find(|p| p.is_focused && !p.is_plugin && !p.is_suppressed)
                         .and_then(|pane| {
-                            // Command panes expose the explicit command. Plain shells
-                            // expose only `title`, which zellij keeps updated to the
-                            // running foreground process (zsh, vim, claude, ...). Falling
-                            // back to title gives every live session a detail line, so a
-                            // running shell is visually distinct from an unstarted dir.
-                            pane.terminal_command.as_ref()
-                                .map(|cmd| basename(cmd))
-                                .or_else(|| clean_title(&pane.title))
+                            // Only command panes expose a meaningful command. Plain shells
+                            // expose only `title` (e.g. "Pane #1"), which is noise — and
+                            // background sessions report no focused pane at all. Liveness is
+                            // instead signalled by the status dot in render_project_name_line.
+                            pane.terminal_command.as_ref().map(|cmd| basename(cmd))
                         })
                 })
         })
@@ -218,18 +215,6 @@ fn basename(cmd: &str) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or(cmd)
         .to_string()
-}
-
-/// Reduce a pane title to a short process label, or None if it carries no signal.
-fn clean_title(title: &str) -> Option<String> {
-    let t = title.trim();
-    if t.is_empty() {
-        return None;
-    }
-    // First whitespace-delimited token, then its basename (handles "/usr/bin/zsh -l").
-    let first = t.split_whitespace().next().unwrap_or(t);
-    let label = basename(first);
-    if label.is_empty() { None } else { Some(label) }
 }
 
 /// Fuzzy subsequence match — all query chars must appear in order in the name
@@ -531,10 +516,7 @@ layout {
             );
             self.pending_commands += 1;
         }
-        if self.pending_commands == 0 {
-            // No running projects to poll, re-arm timer immediately
-            set_timeout(10.0);
-        }
+        // Timer re-arm is owned by the Event::Timer handler (fast AI-state tick).
     }
 
     fn apply_cached_metadata(&mut self) {
@@ -663,18 +645,29 @@ layout {
         let needs_attention = self.attention_sessions.contains(&project.name);
         let is_current_session = matches!(&project.status, SessionStatus::Running { is_current: true, .. });
 
-        // Determine icon + color based on state priority
+        // Determine icon + color based on state priority. Liveness (does a zellij
+        // session exist?) is driven by status, which is reliable for every session —
+        // unlike the focused-pane command, which is empty for background sessions.
         let ai_state = self.ai_states.get(&project.name);
         let (status_icon, dot_color) = if needs_attention {
             ("!", COLOR_MAGENTA)      // ! = needs attention (magenta)
         } else {
             match ai_state {
-                Some(AgentState::Active) => ("▶", COLOR_GREEN),    // ▶ = Claude working (green)
+                Some(AgentState::Active) => ("▶", COLOR_GREEN),    // ▶ = Claude working
                 Some(AgentState::Waiting) | Some(AgentState::Idle) =>
-                    ("■", COLOR_CYAN),                             // ■ = Claude stopped (cyan)
-                _ => ("·", COLOR_ORANGE),                          // · = no AI state
+                    ("■", COLOR_CYAN),                             // ■ = Claude stopped
+                _ => match project.status {
+                    SessionStatus::Running { .. } => ("●", COLOR_GREEN),  // ● = live session, no Claude
+                    SessionStatus::Exited => ("○", COLOR_ORANGE),         // ○ = exited, resurrectable
+                    SessionStatus::NotStarted => ("·", COLOR_ORANGE),     // · = never started
+                },
             }
         };
+
+        // Dim whole row for projects with no live session — background context.
+        let dim_row = !needs_attention
+            && matches!(ai_state, None | Some(AgentState::Unknown))
+            && matches!(project.status, SessionStatus::Exited | SessionStatus::NotStarted);
 
         // Name line: "│ ✦ name                    │"
         let content = format!(" {} {}", status_icon, project.name);
@@ -705,11 +698,13 @@ layout {
         if is_current_session {
             // Green the name text (after icon, before right border)
             text = text.color_range(COLOR_GREEN, 4..line_len.saturating_sub(1));
-        } else if matches!(project.status, SessionStatus::NotStarted | SessionStatus::Exited) {
-            // Dim inactive projects — they're background context
-            text = text.color_range(COLOR_CYAN, 4..line_len.saturating_sub(1));
         }
         // Running non-current: name text stays default (full contrast, these matter)
+
+        // Dim the inner content (between borders) for projects with no live session.
+        if dim_row {
+            text = text.dim_range(1..line_len.saturating_sub(1));
+        }
 
         text
     }
@@ -832,120 +827,132 @@ layout {
     }
 
     fn load_ai_states(&mut self) {
-        // Read per-pane files: /tmp/sidebar-ai/<session>/<pane_id>
-        // Each file: "state timestamp [duration]"
-        // Aggregate per session: hottest state wins, count active panes
+        // Read per-pane files: <plugin /tmp>/sidebar-ai/<session>/<pane_id>.
+        // The plugin runs in a WASI sandbox where `/tmp` maps to the host's
+        // `$TMPDIR/zellij-<uid>/`, so the hook must write there (see README).
+        // Each file: "state timestamp [duration]". Aggregate per session: hottest
+        // state wins, count active panes.
         //
-        // Sessions found in files are authoritative. Two staleness guards prevent
-        // a missed Stop/idle event from leaving a session stuck at "claude · Xh":
-        //   1. Session no longer exists as a zellij session -> evict + delete files.
-        //   2. An `active` turn older than STALE_SECS never received Stop (pane
-        //      killed / claude crashed) -> drop that pane file.
+        // This function is NON-DESTRUCTIVE: multiple sidebar instances read these
+        // shared files concurrently, and SessionUpdate is occasionally incomplete,
+        // so deleting files here would let one instance wipe another's state. The
+        // hook owns file lifecycle (writes on activity, removes on SessionEnd).
+        // Staleness is handled by SKIPPING, never deleting:
+        //   - Session not currently known -> skip + evict in-memory (consistent
+        //     every tick, so no flicker).
+        //   - `active` turn older than STALE_SECS (missed Stop) -> skip the pane.
         const STALE_SECS: u64 = 1800; // 30m
 
         let now = self.now_secs();
+
+        let dir = match std::fs::read_dir("/tmp/sidebar-ai") {
+            Ok(d) => d,
+            // FS unavailable (sandbox hiccup / dir not yet created). Leave existing
+            // in-memory state (from pipe messages) untouched — do NOT evict.
+            Err(_) => return,
+        };
+
         let mut sessions_seen = std::collections::BTreeSet::new();
 
-        if let Ok(sessions) = std::fs::read_dir("/tmp/sidebar-ai") {
-            for session_entry in sessions.flatten() {
-                let session = match session_entry.file_name().to_str().map(|s| s.to_string()) {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let path = session_entry.path();
+        for session_entry in dir.flatten() {
+            let session = match session_entry.file_name().to_str().map(|s| s.to_string()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let path = session_entry.path();
 
-                // Guard 1: zellij session is gone. Only enforce once we have session
-                // data — at startup (before the first SessionUpdate) cached_statuses is
-                // empty and we must not wipe restored state.
-                if self.has_session_data && !self.cached_statuses.contains_key(&session) {
-                    self.evict_ai_session(&session);
-                    let _ = std::fs::remove_dir_all(&path);
-                    continue;
-                }
+            // Session no longer exists as a zellij session. Only enforce once we
+            // have session data — at startup cached_statuses is empty and we must
+            // not wipe restored state. Skip (don't honor) + drop in-memory; never
+            // delete the file (another instance with a complete view may need it).
+            if self.has_session_data && !self.cached_statuses.contains_key(&session) {
+                self.evict_ai_session(&session);
+                continue;
+            }
 
-                sessions_seen.insert(session.clone());
+            sessions_seen.insert(session.clone());
 
-                // Handle both old format (session is a file) and new format (session is a dir)
-                if path.is_file() {
-                    self.load_ai_state_from_file(&session, &path);
-                    continue;
-                }
-                if !path.is_dir() { continue; }
+            // Handle both old format (session is a file) and new format (dir)
+            if path.is_file() {
+                self.load_ai_state_from_file(&session, &path);
+                continue;
+            }
+            if !path.is_dir() { continue; }
 
-                let mut best_state = AgentState::Unknown;
-                let mut best_since: u64 = 0;
-                let mut best_duration: u64 = 0;
-                let mut active_count: usize = 0;
+            let panes = match std::fs::read_dir(&path) {
+                Ok(p) => p,
+                Err(_) => continue, // transient; keep existing state for this session
+            };
 
-                if let Ok(panes) = std::fs::read_dir(&path) {
-                    for pane_entry in panes.flatten() {
-                        let pane_path = pane_entry.path();
-                        if let Ok(data) = std::fs::read_to_string(&pane_path) {
-                            let parts: Vec<&str> = data.trim().split(' ').collect();
-                            let state = match parts.first().copied() {
-                                Some("active") => AgentState::Active,
-                                Some("idle") => AgentState::Idle,
-                                Some("waiting") => AgentState::Waiting,
-                                _ => continue,
-                            };
+            let mut best_state = AgentState::Unknown;
+            let mut best_since: u64 = 0;
+            let mut best_duration: u64 = 0;
+            let mut active_count: usize = 0;
 
-                            let ts = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-                            let dur = parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+            for pane_entry in panes.flatten() {
+                if let Ok(data) = std::fs::read_to_string(pane_entry.path()) {
+                    let parts: Vec<&str> = data.trim().split(' ').collect();
+                    let state = match parts.first().copied() {
+                        Some("active") => AgentState::Active,
+                        Some("idle") => AgentState::Idle,
+                        Some("waiting") => AgentState::Waiting,
+                        _ => continue,
+                    };
 
-                            // Guard 2: an active turn that never closed. Drop the file and
-                            // skip the pane so it does not resurrect next tick.
-                            if matches!(state, AgentState::Active)
-                                && ts > 0 && now.saturating_sub(ts) > STALE_SECS
-                            {
-                                let _ = std::fs::remove_file(&pane_path);
-                                continue;
-                            }
+                    let ts = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+                    let dur = parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
 
-                            if matches!(state, AgentState::Active) {
-                                active_count += 1;
-                            }
+                    // An active turn that never closed (missed Stop). Ignore the
+                    // pane; the hook cleans the file on SessionEnd.
+                    if matches!(state, AgentState::Active)
+                        && ts > 0 && now.saturating_sub(ts) > STALE_SECS
+                    {
+                        continue;
+                    }
 
-                            // Priority: Active > Waiting > Idle > Unknown
-                            let dominated = match (&best_state, &state) {
-                                (_, AgentState::Active) => true,
-                                (AgentState::Active, _) => false,
-                                (_, AgentState::Waiting) => true,
-                                (AgentState::Waiting, _) => false,
-                                (_, AgentState::Idle) => true,
-                                _ => false,
-                            };
-                            if dominated {
-                                best_state = state;
-                                best_since = ts;
-                                best_duration = dur;
-                            }
-                        }
+                    if matches!(state, AgentState::Active) {
+                        active_count += 1;
+                    }
+
+                    // Priority: Active > Waiting > Idle > Unknown
+                    let dominated = match (&best_state, &state) {
+                        (_, AgentState::Active) => true,
+                        (AgentState::Active, _) => false,
+                        (_, AgentState::Waiting) => true,
+                        (AgentState::Waiting, _) => false,
+                        (_, AgentState::Idle) => true,
+                        _ => false,
+                    };
+                    if dominated {
+                        best_state = state;
+                        best_since = ts;
+                        best_duration = dur;
                     }
                 }
+            }
 
-                if !matches!(best_state, AgentState::Unknown) {
-                    self.ai_states.insert(session.clone(), best_state);
-                    if best_since > 0 {
-                        self.ai_state_since.insert(session.clone(), best_since);
-                    }
-                    if best_duration > 0 {
-                        self.ai_last_duration.insert(session.clone(), best_duration);
-                    }
-                    if active_count > 0 {
-                        self.ai_pane_count.insert(session, active_count);
-                    } else {
-                        self.ai_pane_count.remove(&session);
-                    }
+            if !matches!(best_state, AgentState::Unknown) {
+                self.ai_states.insert(session.clone(), best_state);
+                if best_since > 0 {
+                    self.ai_state_since.insert(session.clone(), best_since);
+                }
+                if best_duration > 0 {
+                    self.ai_last_duration.insert(session.clone(), best_duration);
+                }
+                if active_count > 0 {
+                    self.ai_pane_count.insert(session, active_count);
                 } else {
-                    // No live state remained (all panes stale/cleared) -> evict.
-                    self.evict_ai_session(&session);
+                    self.ai_pane_count.remove(&session);
                 }
+            } else {
+                // Dir present but no live state (all panes stale/cleared) -> evict.
+                self.evict_ai_session(&session);
             }
         }
 
-        // Evict stale in-memory Active states not confirmed by any file.
-        // Pipe messages set Active immediately; files are the persistent truth.
-        // Without this, a missed Stop/idle pipe leaves sessions stuck at "Active Xh".
+        // Evict in-memory Active states with no backing file at all (a pipe set
+        // Active but the file is gone — e.g. session ended). Runs only because
+        // read_dir succeeded above, so an empty sessions_seen is authoritative.
         let stale: Vec<String> = self.ai_states.iter()
             .filter(|(session, state)| {
                 matches!(state, AgentState::Active) && !sessions_seen.contains(*session)
@@ -1211,11 +1218,7 @@ impl ZellijPlugin for State {
                         if self.pending_commands > 0 {
                             self.pending_commands -= 1;
                         }
-                        // Re-arm timer when all results are in
-                        if self.pending_commands == 0 {
-                            eprintln!("All git commands complete, re-arming timer");
-                            set_timeout(10.0);
-                        }
+                        // Timer re-arm is owned by the Event::Timer handler.
                         changed
                     }
                     _ => false,
@@ -1230,8 +1233,10 @@ impl ZellijPlugin for State {
                     // AI state from pipe messages must survive SessionUpdate cycles
                     let known_names: BTreeSet<String> = self.cached_statuses.keys().cloned().collect();
                     self.cached_metadata.retain(|name, _| known_names.contains(name));
-                    // Prune stale AI states for sessions that no longer exist
-                    self.ai_states.retain(|name, _| known_names.contains(name));
+                    // NOTE: do not prune ai_states here. SessionUpdate is occasionally
+                    // incomplete (lists only the current session), which would drop other
+                    // sessions' Claude state and cause flicker. load_ai_states owns AI-state
+                    // eviction (session-gone is reconciled there against the shared files).
 
                     if self.scan_complete {
                         self.apply_cached_statuses();
@@ -1410,17 +1415,23 @@ impl ZellijPlugin for State {
                 _ => false,
             },
             Event::Timer(_elapsed) => {
-                // Refresh cross-session AI state from /cache on every tick
+                // Fast tick: refresh AI state from the shared files every ~1.5s so a
+                // missed/slow pipe message still surfaces quickly. File reads are cheap
+                // (a few tiny files). Git branch polling is far heavier (spawns a process
+                // per project), so gate it to roughly every 10s and only when the last
+                // batch finished.
+                const AI_POLL_SECS: f64 = 1.5;
+                const GIT_EVERY: usize = 7; // 7 * 1.5s ≈ 10.5s
+
                 self.load_ai_states();
-                if self.pending_commands == 0 {
-                    self.poll_tick += 1;
+                self.poll_tick += 1;
+                if self.pending_commands == 0
+                    && (self.poll_tick == 1 || self.poll_tick % GIT_EVERY == 0)
+                {
                     self.poll_git_branches();
-                    eprintln!("Poll tick {} -- dispatched git commands (pending: {})", self.poll_tick, self.pending_commands);
-                } else {
-                    // Commands still pending from last cycle, skip this tick
-                    eprintln!("Poll tick skipped -- {} commands still pending", self.pending_commands);
                 }
-                true // re-render to show updated cross-session AI state
+                set_timeout(AI_POLL_SECS);
+                true // re-render to show updated AI state
             }
             _ => false,
         }

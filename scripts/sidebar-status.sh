@@ -1,7 +1,10 @@
 #!/bin/bash
 # sidebar-status.sh -- Claude Code hook for Zellij sidebar AI state
-# One file per pane: /tmp/sidebar-ai/<session>/<pane_id>
+# One file per pane: $TMPDIR/zellij-<uid>/sidebar-ai/<session>/<pane_id>
 # Format: "state timestamp [duration]"
+#
+# NOTE: the sidebar plugin runs in a WASI sandbox where its `/tmp` maps to the
+# host's $TMPDIR/zellij-<uid>/, so this hook must write there (not host /tmp).
 
 INPUT=$(cat)
 SESSION="$ZELLIJ_SESSION_NAME"
@@ -11,7 +14,7 @@ PANE="${ZELLIJ_PANE_ID:-0}"
 EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null)
 [ -z "$EVENT" ] && exit 0
 
-STATE_DIR="/tmp/sidebar-ai/$SESSION"
+STATE_DIR="${TMPDIR:-/tmp/}zellij-$(id -u)/sidebar-ai/$SESSION"
 mkdir -p "$STATE_DIR" 2>/dev/null
 NOW=$(date +%s)
 
@@ -23,7 +26,7 @@ case "$EVENT" in
     fi
     zellij pipe --name "sidebar::ai-active::${SESSION}" 2>/dev/null &
     ;;
-  Stop|Notification|SessionEnd)
+  Stop|Notification)
     CURRENT=$(cat "$STATE_DIR/$PANE" 2>/dev/null)
     STARTED=$(echo "$CURRENT" | awk '{print $2}')
     DURATION=0
@@ -38,6 +41,12 @@ case "$EVENT" in
     fi
     echo "$STATE $NOW $DURATION" > "$STATE_DIR/$PANE"
     zellij pipe --name "${PIPE}::${SESSION}" 2>/dev/null &
+    ;;
+  SessionEnd)
+    # Session ended — remove this pane's state so a future session of the same
+    # name doesn't inherit a stale "claude" row.
+    rm -f "$STATE_DIR/$PANE" 2>/dev/null
+    rmdir "$STATE_DIR" 2>/dev/null
     ;;
 esac
 
