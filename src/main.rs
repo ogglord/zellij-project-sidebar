@@ -841,7 +841,7 @@ layout {
         //   - Session not currently known -> skip + evict in-memory (consistent
         //     every tick, so no flicker).
         //   - Any turn older than STALE_SECS (crashed/killed session) -> skip the pane.
-        const STALE_SECS: u64 = 900; // 15m
+        const STALE_SECS: u64 = 3600; // 60m
 
         let now = self.now_secs();
 
@@ -964,7 +964,7 @@ layout {
                 _ => return,
             };
             let ts = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            if ts > 0 && self.now_secs().saturating_sub(ts) > 900 {
+            if ts > 0 && self.now_secs().saturating_sub(ts) > 3600 {
                 return; // stale
             }
             self.ai_states.insert(session.to_string(), state);

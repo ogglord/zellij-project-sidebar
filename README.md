@@ -153,7 +153,7 @@ The sidebar shows real-time AI agent activity across all your Zellij sessions. W
 
 AI state is shared across all sessions via per-pane files under `$TMPDIR/zellij-<uid>/sidebar-ai/<session>/<pane_id>`. The plugin runs in a WASI sandbox where its `/tmp` maps to the host's `$TMPDIR/zellij-<uid>/`, so the hook writes there (not host `/tmp`). Each sidebar instance reads these files on a ~10-second timer, so cross-session state appears within seconds. Pipe messages provide instant updates for the current session.
 
-The plugin self-heals stale state without deleting shared files (multiple instances read them concurrently): a session no longer present in Zellij is dropped from the display, and an `active` turn older than 30 minutes that never received a `Stop` (pane killed / agent crashed) is ignored. Register the `SessionEnd` hook (below) so a clean exit removes its state file immediately.
+The plugin self-heals stale state without deleting shared files (multiple instances read them concurrently): a session no longer present in Zellij is dropped from the display, and an `active` turn older than 60 minutes that never received a `Stop` (pane killed / agent crashed) is ignored. Register the `SessionEnd` hook (below) so a clean exit removes its state file immediately.
 
 ### Setting up Claude Code hooks
 
