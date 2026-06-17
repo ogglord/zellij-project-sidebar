@@ -151,7 +151,9 @@ The sidebar shows real-time AI agent activity across all your Zellij sessions. W
 
 ### How it works
 
-AI state is shared across all sessions via per-session files in `$TMPDIR/zellij-$(id -u)/sidebar-ai/`. Each sidebar instance reads these files on a ~10-second timer, so cross-session state appears within seconds. Pipe messages provide instant updates for the current session.
+AI state is shared across all sessions via per-pane files under `/tmp/sidebar-ai/<session>/<pane_id>`. Each sidebar instance reads these files on a ~10-second timer, so cross-session state appears within seconds. Pipe messages provide instant updates for the current session.
+
+The plugin self-heals stale state: an `active` turn whose Zellij session no longer exists is dropped (and its files deleted), and an `active` turn older than 30 minutes that never received a `Stop` (pane killed / agent crashed) is discarded. Register the `SessionEnd` hook (below) so clean exits clear immediately rather than waiting on the timeout.
 
 ### Setting up Claude Code hooks
 
@@ -170,7 +172,8 @@ Then register it in `~/.claude/settings.json`:
     "PostToolUse": [{ "hooks": [{ "type": "command", "command": "$HOME/.claude/hooks/sidebar-status.sh", "async": true }] }],
     "Stop": [{ "hooks": [{ "type": "command", "command": "$HOME/.claude/hooks/sidebar-status.sh", "async": true }] }],
     "Notification": [{ "hooks": [{ "type": "command", "command": "$HOME/.claude/hooks/sidebar-status.sh", "async": true }] }],
-    "SessionStart": [{ "hooks": [{ "type": "command", "command": "$HOME/.claude/hooks/sidebar-status.sh", "async": true }] }]
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "$HOME/.claude/hooks/sidebar-status.sh", "async": true }] }],
+    "SessionEnd": [{ "hooks": [{ "type": "command", "command": "$HOME/.claude/hooks/sidebar-status.sh", "async": true }] }]
   }
 }
 ```
@@ -185,7 +188,8 @@ Any tool can integrate — just write to the shared state directory:
 
 ```bash
 # Signal that an AI agent is working in the current session
-echo "active $(date +%s)" > "${TMPDIR:-/tmp/}zellij-$(id -u)/sidebar-ai/$ZELLIJ_SESSION_NAME"
+mkdir -p "/tmp/sidebar-ai/$ZELLIJ_SESSION_NAME"
+echo "active $(date +%s)" > "/tmp/sidebar-ai/$ZELLIJ_SESSION_NAME/${ZELLIJ_PANE_ID:-0}"
 
 # Or use pipes for instant updates in the current session
 zellij pipe --name "sidebar::ai-active::$ZELLIJ_SESSION_NAME"

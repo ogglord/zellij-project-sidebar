@@ -198,17 +198,38 @@ fn extract_active_command(session: &SessionInfo) -> Option<String> {
                     panes.iter()
                         .find(|p| p.is_focused && !p.is_plugin && !p.is_suppressed)
                         .and_then(|pane| {
+                            // Command panes expose the explicit command. Plain shells
+                            // expose only `title`, which zellij keeps updated to the
+                            // running foreground process (zsh, vim, claude, ...). Falling
+                            // back to title gives every live session a detail line, so a
+                            // running shell is visually distinct from an unstarted dir.
                             pane.terminal_command.as_ref()
-                                .map(|cmd| {
-                                    PathBuf::from(cmd)
-                                        .file_name()
-                                        .and_then(|n| n.to_str())
-                                        .unwrap_or(cmd)
-                                        .to_string()
-                                })
+                                .map(|cmd| basename(cmd))
+                                .or_else(|| clean_title(&pane.title))
                         })
                 })
         })
+}
+
+/// Last path component of a command string.
+fn basename(cmd: &str) -> String {
+    PathBuf::from(cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(cmd)
+        .to_string()
+}
+
+/// Reduce a pane title to a short process label, or None if it carries no signal.
+fn clean_title(title: &str) -> Option<String> {
+    let t = title.trim();
+    if t.is_empty() {
+        return None;
+    }
+    // First whitespace-delimited token, then its basename (handles "/usr/bin/zsh -l").
+    let first = t.split_whitespace().next().unwrap_or(t);
+    let label = basename(first);
+    if label.is_empty() { None } else { Some(label) }
 }
 
 /// Fuzzy subsequence match — all query chars must appear in order in the name
@@ -802,13 +823,27 @@ layout {
         // Pipe messages handle instant in-memory updates for the current session.
     }
 
+    /// Remove all AI tracking for a session (state, pane count, timestamps).
+    fn evict_ai_session(&mut self, session: &str) {
+        self.ai_states.remove(session);
+        self.ai_pane_count.remove(session);
+        self.ai_state_since.remove(session);
+        self.ai_last_duration.remove(session);
+    }
+
     fn load_ai_states(&mut self) {
         // Read per-pane files: /tmp/sidebar-ai/<session>/<pane_id>
         // Each file: "state timestamp [duration]"
         // Aggregate per session: hottest state wins, count active panes
         //
-        // Sessions found in files are authoritative. In-memory Active states
-        // with no backing file get evicted to prevent stale "claude · Xh".
+        // Sessions found in files are authoritative. Two staleness guards prevent
+        // a missed Stop/idle event from leaving a session stuck at "claude · Xh":
+        //   1. Session no longer exists as a zellij session -> evict + delete files.
+        //   2. An `active` turn older than STALE_SECS never received Stop (pane
+        //      killed / claude crashed) -> drop that pane file.
+        const STALE_SECS: u64 = 1800; // 30m
+
+        let now = self.now_secs();
         let mut sessions_seen = std::collections::BTreeSet::new();
 
         if let Ok(sessions) = std::fs::read_dir("/tmp/sidebar-ai") {
@@ -818,6 +853,16 @@ layout {
                     None => continue,
                 };
                 let path = session_entry.path();
+
+                // Guard 1: zellij session is gone. Only enforce once we have session
+                // data — at startup (before the first SessionUpdate) cached_statuses is
+                // empty and we must not wipe restored state.
+                if self.has_session_data && !self.cached_statuses.contains_key(&session) {
+                    self.evict_ai_session(&session);
+                    let _ = std::fs::remove_dir_all(&path);
+                    continue;
+                }
+
                 sessions_seen.insert(session.clone());
 
                 // Handle both old format (session is a file) and new format (session is a dir)
@@ -834,7 +879,8 @@ layout {
 
                 if let Ok(panes) = std::fs::read_dir(&path) {
                     for pane_entry in panes.flatten() {
-                        if let Ok(data) = std::fs::read_to_string(pane_entry.path()) {
+                        let pane_path = pane_entry.path();
+                        if let Ok(data) = std::fs::read_to_string(&pane_path) {
                             let parts: Vec<&str> = data.trim().split(' ').collect();
                             let state = match parts.first().copied() {
                                 Some("active") => AgentState::Active,
@@ -845,6 +891,15 @@ layout {
 
                             let ts = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
                             let dur = parts.get(2).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+
+                            // Guard 2: an active turn that never closed. Drop the file and
+                            // skip the pane so it does not resurrect next tick.
+                            if matches!(state, AgentState::Active)
+                                && ts > 0 && now.saturating_sub(ts) > STALE_SECS
+                            {
+                                let _ = std::fs::remove_file(&pane_path);
+                                continue;
+                            }
 
                             if matches!(state, AgentState::Active) {
                                 active_count += 1;
@@ -881,11 +936,14 @@ layout {
                     } else {
                         self.ai_pane_count.remove(&session);
                     }
+                } else {
+                    // No live state remained (all panes stale/cleared) -> evict.
+                    self.evict_ai_session(&session);
                 }
             }
         }
 
-        // Evict stale in-memory Active states not confirmed by files.
+        // Evict stale in-memory Active states not confirmed by any file.
         // Pipe messages set Active immediately; files are the persistent truth.
         // Without this, a missed Stop/idle pipe leaves sessions stuck at "Active Xh".
         let stale: Vec<String> = self.ai_states.iter()
@@ -895,8 +953,7 @@ layout {
             .map(|(s, _)| s.clone())
             .collect();
         for session in stale {
-            self.ai_states.remove(&session);
-            self.ai_pane_count.remove(&session);
+            self.evict_ai_session(&session);
         }
     }
 

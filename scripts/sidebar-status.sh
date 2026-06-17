@@ -11,7 +11,7 @@ PANE="${ZELLIJ_PANE_ID:-0}"
 EVENT=$(echo "$INPUT" | jq -r '.hook_event_name // empty' 2>/dev/null)
 [ -z "$EVENT" ] && exit 0
 
-STATE_DIR="${TMPDIR:-/tmp/}zellij-$(id -u)/sidebar-ai/$SESSION"
+STATE_DIR="/tmp/sidebar-ai/$SESSION"
 mkdir -p "$STATE_DIR" 2>/dev/null
 NOW=$(date +%s)
 
@@ -23,7 +23,7 @@ case "$EVENT" in
     fi
     zellij pipe --name "sidebar::ai-active::${SESSION}" 2>/dev/null &
     ;;
-  Stop|Notification)
+  Stop|Notification|SessionEnd)
     CURRENT=$(cat "$STATE_DIR/$PANE" 2>/dev/null)
     STARTED=$(echo "$CURRENT" | awk '{print $2}')
     DURATION=0

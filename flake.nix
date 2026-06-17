@@ -15,6 +15,33 @@
       forAllSystems = nixpkgs.lib.genAttrs systems;
     in
     {
+      devShells = forAllSystems (
+        system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+        in
+        {
+          # Iterative `cargo build --release --target wasm32-wasip1`.
+          # nixpkgs' rustc ships no wasm32-wasip1 std, so we use rustup to fetch the
+          # target std on demand. stdenv.cc is needed to link host build scripts
+          # (proc-macro crates); the wasm target itself links via rustup's rust-lld.
+          # For reproducible/CI builds use `nix build` instead (pkgsCross.wasi32).
+          default = pkgs.mkShell {
+            packages = with pkgs; [
+              rustup
+              stdenv.cc
+              lld
+              pkg-config
+            ];
+            shellHook = ''
+              rustup toolchain list 2>/dev/null | grep -q '(default)' || rustup default stable
+              rustup target list --installed 2>/dev/null | grep -q wasm32-wasip1 \
+                || rustup target add wasm32-wasip1
+            '';
+          };
+        }
+      );
+
       packages = forAllSystems (
         system:
         let
