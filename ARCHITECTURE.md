@@ -22,7 +22,7 @@ Each sidebar instance reads these files on a ~10-second timer. Multiple instance
 |----------|---------|-------------|
 | `SIDEBAR_STALE_TIMEOUT` | `3600` (seconds = 60 min) | How long a state file can persist without a heartbeat before the plugin ignores it. Applies to both AI and shell state. |
 
-The `zellij-sidebar-init` hook generator reads this variable and bakes it into the emitted shell code so the hooks themselves know the timeout (e.g. for stale cleanup). The plugin also reads it at runtime.
+The `zellij-ssidebar` hook generator reads this variable and bakes it into the emitted shell code so the hooks themselves know the timeout (e.g. for stale cleanup). The plugin also reads it at runtime.
 
 ## Stale State Model
 
@@ -40,7 +40,7 @@ Shell hooks write the basename of the current command. NixOS wrapper scripts are
 
 ## Hook Chaining
 
-The `zellij-sidebar-init` binary generates hook code that **chains** with existing `preexec`/`precmd` hooks:
+The `zellij-ssidebar` binary generates hook code that **chains** with existing `preexec`/`precmd` hooks:
 - **zsh**: appends to `preexec_functions` and `precmd_functions` arrays
 - **bash**: chains via `PROMPT_COMMAND` / `DEBUG` trap
 

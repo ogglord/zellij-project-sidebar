@@ -13,7 +13,7 @@ echo "Building release..."
 cargo build --release --target wasm32-wasip1
 
 echo "Installing..."
-cp target/wasm32-wasip1/release/zellij-project-sidebar.wasm ~/.config/zellij/plugins/zellij-project-sidebar.wasm
+cp target/wasm32-wasip1/release/zellij-ssidebar.wasm ~/.config/zellij/plugins/zellij-ssidebar.wasm
 
 echo ""
 echo "Installed. Reload the plugin in each session:"

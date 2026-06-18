@@ -170,7 +170,7 @@ impl Default for State {
             browse_mode: false,
             scan_dir: None,
             use_discovery: false,
-            sidebar_plugin_path: "file:~/.config/zellij/plugins/zellij-project-sidebar.wasm".to_string(),
+            sidebar_plugin_path: "file:~/.config/zellij/plugins/zellij-ssidebar.wasm".to_string(),
             discovered_dirs: Vec::new(),
             scan_complete: false,
             has_session_data: false,

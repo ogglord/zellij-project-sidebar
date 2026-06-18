@@ -1,4 +1,4 @@
-# zellij-project-sidebar
+# zellij-ssidebar
 
 A persistent sidebar plugin for [Zellij](https://zellij.dev) that shows your active project sessions at a glance. Click or keyboard-navigate to switch between projects, start new sessions, and see real-time AI agent and shell activity across all sessions.
 
@@ -8,7 +8,7 @@ A persistent sidebar plugin for [Zellij](https://zellij.dev) that shows your act
 
 Give this prompt to Claude Code (or your AI coding tool of choice) and it will handle everything:
 
-> Install the zellij-project-sidebar plugin from https://github.com/AndrewBeniston/zellij-project-sidebar. Clone the repo, build with `cargo build --target wasm32-wasip1 --release`, copy the .wasm to `~/.config/zellij/plugins/`. Then update my Zellij layout to include the sidebar with `scan_dir` pointing to my projects directory. Set up Claude Code hooks using the sidebar-status.sh script from the repo so the sidebar shows real-time AI activity indicators across all sessions (see the "AI activity indicators" section in the README for full setup). Also configure the attention system hooks for `sidebar::attention::` and `sidebar::clear::` pipe messages. Set up shell activity tracking with `zellij-sidebar-init` so the sidebar shows foreground commands like `nvim` and `lazygit` in the detail line.
+> Install the zellij-ssidebar plugin from https://github.com/AndrewBeniston/zellij-ssidebar. Clone the repo, build with `cargo build --target wasm32-wasip1 --release`, copy the .wasm to `~/.config/zellij/plugins/`. Then update my Zellij layout to include the sidebar with `scan_dir` pointing to my projects directory. Set up Claude Code hooks using the sidebar-status.sh script from the repo so the sidebar shows real-time AI activity indicators across all sessions (see the "AI activity indicators" section in the README for full setup). Also configure the attention system hooks for `sidebar::attention::` and `sidebar::clear::` pipe messages. Set up shell activity tracking with `zellij-ssidebar` so the sidebar shows foreground commands like `nvim` and `lazygit` in the detail line.
 
 ## Why?
 
@@ -35,21 +35,21 @@ Zellij has great session management, but no ambient awareness. You can't see at 
 ### Build from source
 
 ```bash
-git clone https://github.com/AndrewBeniston/zellij-project-sidebar.git
-cd zellij-project-sidebar
-cargo build --target wasm32-wasip1 --release
-cp target/wasm32-wasip1/release/zellij-project-sidebar.wasm ~/.config/zellij/plugins/
+git clone https://github.com/AndrewBeniston/zellij-ssidebar.git
+cd zellij-ssidebar
+cargo build --release --target wasm32-wasip1
+cp target/wasm32-wasip1/release/zellij-ssidebar.wasm ~/.config/zellij/plugins/
 ```
 
 > Requires Rust with the `wasm32-wasip1` target: `rustup target add wasm32-wasip1`
 
 ### Build the init binary
 
-The shell activity hook requires the `zellij-sidebar-init` binary:
+The shell activity hook requires the `zellij-ssidebar` binary:
 
 ```bash
-cargo build --release --bin zellij-sidebar-init
-cp target/release/zellij-sidebar-init ~/.local/bin/
+cargo build --release --manifest-path src/init/Cargo.toml
+cp src/init/target/release/zellij-ssidebar ~/.local/bin/
 ```
 
 ## Configuration
@@ -67,7 +67,7 @@ layout {
     }
     pane split_direction="vertical" {
         pane size="15%" name="Projects" {
-            plugin location="file:~/.config/zellij/plugins/zellij-project-sidebar.wasm" {
+            plugin location="file:~/.config/zellij/plugins/zellij-ssidebar.wasm" {
                 scan_dir "/Users/you/Projects"
                 session_layout "/Users/you/.config/zellij/layouts/default.kdl"
             }
@@ -88,7 +88,7 @@ layout {
 Manually list projects:
 
 ```kdl
-plugin location="file:~/.config/zellij/plugins/zellij-project-sidebar.wasm" {
+plugin location="file:~/.config/zellij/plugins/zellij-ssidebar.wasm" {
     project_0 "/Users/you/Projects/my-app"
     project_1 "/Users/you/Projects/api-server"
     project_2 "/Users/you/Projects/docs"
@@ -163,14 +163,14 @@ The sidebar can show foreground commands running in any session — `nvim`, `laz
 
 Shell command state is shared via per-pane files under `$TMPDIR/zellij-<uid>/sidebar-shell/<session>/<pane_id>`. The format is `command_name timestamp`. The plugin reads these files on the same ~1.5s timer as the AI state.
 
-### Setup with `zellij-sidebar-init`
+### Setup with `zellij-ssidebar`
 
-The `zellij-sidebar-init` binary generates shell hook code that chains with your existing `preexec`/`precmd` hooks (same pattern as direnv, starship, zoxide, and atuin):
+The `zellij-ssidebar` binary generates shell hook code that chains with your existing `preexec`/`precmd` hooks (same pattern as direnv, starship, zoxide, and atuin):
 
 **Zsh:**
 
 ```bash
-eval "$(zellij-sidebar-init hook zsh)"
+eval "$(zellij-ssidebar hook zsh)"
 ```
 
 Add to `~/.zshrc` (or use the NixOS module below).
@@ -178,7 +178,7 @@ Add to `~/.zshrc` (or use the NixOS module below).
 **Bash:**
 
 ```bash
-eval "$(zellij-sidebar-init hook bash)"
+eval "$(zellij-ssidebar hook bash)"
 ```
 
 Add to `~/.bashrc` (or use the NixOS module below).
@@ -189,17 +189,17 @@ The generated hooks:
 - Strip NixOS wrapper prefixes (`__nvim-wrapped` → `nvim`)
 - Chain with existing hooks so they don't clobber each other
 
-### NixOS / Home Manager
+### NixOS
 
-A NixOS module is provided in `nix/module.nix`. Add it to your Home Manager configuration:
+A NixOS module is provided in `nix/module.nix`. Import it from the flake:
 
 ```nix
-{ config, pkgs, ... }:
+{ inputs, ... }:
 
 {
-  imports = [ ./path/to/nix/module.nix ];
+  imports = [ inputs.zellij-ssidebar.nixosModules.default ];
 
-  programs.zellij.project-sidebar = {
+  programs.zellij.ssidebar = {
     enable = true;
     enableZshIntegration = true;
     enableBashIntegration = false;
@@ -208,7 +208,13 @@ A NixOS module is provided in `nix/module.nix`. Add it to your Home Manager conf
 }
 ```
 
-This injects the `eval "$(zellij-sidebar-init hook ...)` line into your shell config and sets the `SIDEBAR_STALE_TIMEOUT` environment variable.
+This:
+- Installs the `zellij-ssidebar` binary to the system PATH
+- Puts the `.wasm` plugin at `/etc/zellij/plugins/zellij-ssidebar.wasm`
+- Injects the `eval "$(zellij-ssidebar hook ...)` line into your shell config
+- Sets the `SIDEBAR_STALE_TIMEOUT` environment variable
+
+> **Note:** The module is a pure NixOS module — it does not require Home Manager. The plugin is installed system-wide to `/etc/zellij/plugins/` where all users can access it.
 
 ## AI activity indicators
 

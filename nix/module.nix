@@ -1,25 +1,25 @@
-{ config, lib, pkgs, ... }:
+{ config, lib, pkgs, package, pluginPackage }:
 
 with lib;
 
 let
-  cfg = config.programs.zellij.project-sidebar;
+  cfg = config.programs.zellij.ssidebar;
 
   initScript = shell: ''
-    eval "$(${pkgs.zellij-sidebar-init}/bin/zellij-sidebar-init hook ${shell})"
+    eval "$(${package}/bin/zellij-ssidebar hook ${shell})"
   '';
 in
 
 {
-  options.programs.zellij.project-sidebar = {
-    enable = mkEnableOption "zellij-project-sidebar shell activity tracking";
+  options.programs.zellij.ssidebar = {
+    enable = mkEnableOption "zellij-ssidebar shell activity tracking and AI activity indicators";
 
     enableZshIntegration = mkOption {
       type = types.bool;
       default = false;
       description = ''
         Whether to enable the shell hook in zsh.
-        Injects the init command into `programs.zsh.initContent`.
+        Injects the init command into `programs.zsh.interactiveShellInit`.
       '';
     };
 
@@ -28,7 +28,7 @@ in
       default = false;
       description = ''
         Whether to enable the shell hook in bash.
-        Injects the init command into `programs.bash.initExtra`.
+        Injects the init command into `programs.bash.shellInit`.
       '';
     };
 
@@ -44,11 +44,15 @@ in
   };
 
   config = mkIf cfg.enable {
-    home.sessionVariables.SIDEBAR_STALE_TIMEOUT = toString cfg.staleTimeout;
+    environment.sessionVariables.SIDEBAR_STALE_TIMEOUT = toString cfg.staleTimeout;
 
-    programs.zsh.initContent = mkIf cfg.enableZshIntegration (initScript "zsh");
-    programs.bash.initExtra = mkIf cfg.enableBashIntegration (initScript "bash");
+    programs.zsh.interactiveShellInit = mkIf cfg.enableZshIntegration (initScript "zsh");
+    programs.bash.shellInit = mkIf cfg.enableBashIntegration (initScript "bash");
 
-    home.packages = [ pkgs.zellij-sidebar-init ];
+    environment.systemPackages = [ package ];
+
+    environment.etc."zellij/plugins/zellij-ssidebar.wasm" = {
+      source = "${pluginPackage}/zellij-ssidebar.wasm";
+    };
   };
 }

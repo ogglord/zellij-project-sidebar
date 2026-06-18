@@ -1,5 +1,5 @@
 {
-  description = "Zellij project sidebar plugin";
+  description = "Zellij session sidebar plugin with shell activity tracking";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
@@ -21,11 +21,6 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
-          # Iterative `cargo build --release --target wasm32-wasip1`.
-          # nixpkgs' rustc ships no wasm32-wasip1 std, so we use rustup to fetch the
-          # target std on demand. stdenv.cc is needed to link host build scripts
-          # (proc-macro crates); the wasm target itself links via rustup's rust-lld.
-          # For reproducible/CI builds use `nix build` instead (pkgsCross.wasi32).
           default = pkgs.mkShell {
             packages = with pkgs; [
               rustup
@@ -47,37 +42,66 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
           wasiPkgs = pkgs.pkgsCross.wasi32;
-        in
-        {
-          default = wasiPkgs.rustPlatform.buildRustPackage {
-            pname = "zellij-project-sidebar";
+
+          # The native init binary (zsh/bash hook generator)
+          # Built from src/init/ — a separate crate with no dependencies
+          initBinary = pkgs.rustPlatform.buildRustPackage {
+            pname = "zellij-ssidebar";
             version = "unstable-${self.lastModifiedDate or "unknown"}";
-
-            src = self;
-            cargoLock.lockFile = ./Cargo.lock;
-
-            # wasm-ld fix: pkgsCross.wasi32.rustPlatform injects wasm32-unknown-wasi-cc as
-            # the linker, but Rust's wasm32-wasip1 target needs wasm-ld directly.
-            # See: https://github.com/NixOS/nixpkgs/pull/463720
-            nativeBuildInputs = [ wasiPkgs.lld ];
-            env.RUSTFLAGS = "-C linker=wasm-ld";
-
-            installPhase = ''
-              runHook preInstall
-              wasm=$(find target -name 'zellij-project-sidebar.wasm' -path '*/release/*' | head -1)
-              [ -n "$wasm" ] || { echo "zellij-project-sidebar.wasm not found in target/release"; exit 1; }
-              install -m755 "$wasm" "$out"
-              runHook postInstall
-            '';
-
+            src = ./src/init;
+            cargoLock.lockFile = ./src/init/Cargo.lock;
             doCheck = false;
-
             meta = {
-              description = "Zellij sidebar plugin: project list with AI activity indicators";
+              description = "Shell hook generator for zellij-ssidebar";
               license = pkgs.lib.licenses.mit;
             };
           };
+
+          # The WASM plugin
+          wasmPlugin = wasiPkgs.rustPlatform.buildRustPackage {
+            pname = "zellij-ssidebar";
+            version = "unstable-${self.lastModifiedDate or "unknown"}";
+            src = self;
+            cargoLock.lockFile = ./Cargo.lock;
+            nativeBuildInputs = [ wasiPkgs.lld ];
+            env.RUSTFLAGS = "-C linker=wasm-ld";
+            installPhase = ''
+              runHook preInstall
+              wasm=$(find target -name 'zellij-ssidebar.wasm' -path '*/release/*' | head -1)
+              [ -n "$wasm" ] || { echo "zellij-ssidebar.wasm not found"; exit 1; }
+              install -m755 "$wasm" "$out"
+              runHook postInstall
+            '';
+            doCheck = false;
+            meta = {
+              description = "Zellij sidebar plugin: project list with AI and shell activity indicators";
+              license = pkgs.lib.licenses.mit;
+            };
+          };
+        in
+        {
+          default = initBinary;
+          zellij-ssidebar = initBinary;
+          zellij-ssidebar-plugin = wasmPlugin;
         }
       );
+
+      # NixOS module — primary interface
+      nixosModules.default =
+        { config, lib, pkgs, ... }:
+        import ./nix/module.nix {
+          inherit config lib pkgs;
+          package = self.packages.${pkgs.system}.zellij-ssidebar;
+          pluginPackage = self.packages.${pkgs.system}.zellij-ssidebar-plugin;
+        };
+
+      # Home Manager module — for those who prefer user-level config
+      homeManagerModules.default =
+        { config, lib, pkgs, ... }:
+        import ./nix/module.nix {
+          inherit config lib pkgs;
+          package = self.packages.${pkgs.system}.zellij-ssidebar;
+          pluginPackage = self.packages.${pkgs.system}.zellij-ssidebar-plugin;
+        };
     };
 }
