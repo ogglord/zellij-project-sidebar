@@ -149,6 +149,10 @@ struct State {
     ai_state_since: BTreeMap<String, u64>, // unix timestamp when state started
     ai_last_duration: BTreeMap<String, u64>, // seconds the last active turn lasted
     ai_pane_count: BTreeMap<String, usize>,  // number of active AI panes per session
+
+    // Shell foreground command state — per-pane, from shell hooks
+    shell_commands: BTreeMap<String, Vec<(String, u64)>>, // session -> [(command, timestamp), ...]
+    shell_pane_count: BTreeMap<String, usize>,  // number of active shell panes per session
 }
 
 impl Default for State {
@@ -181,6 +185,8 @@ impl Default for State {
             ai_state_since: BTreeMap::new(),
             ai_last_duration: BTreeMap::new(),
             ai_pane_count: BTreeMap::new(),
+            shell_commands: BTreeMap::new(),
+            shell_pane_count: BTreeMap::new(),
         }
     }
 }
@@ -737,14 +743,38 @@ layout {
             let end = content.chars().count() + 1;
             segments.push((start, end, detail_color));
             has_content = true;
-        } else if let SessionStatus::Running { active_command: Some(cmd), .. } = &project.status {
-            // Fallback: show active_command from Zellij API (any session)
-            if has_content { content.push_str(" · "); }
-            let start = content.chars().count() + 1;
-            content.push_str(cmd);
-            let end = content.chars().count() + 1;
-            segments.push((start, end, COLOR_ORANGE));
-            has_content = true;
+        }
+
+        // Shell commands — show up to 5, with duration, deduplicated
+        if let Some(commands) = self.shell_commands.get(&project.name) {
+            let now = self.now_secs();
+            let mut seen = std::collections::HashSet::new();
+            let mut shown = 0;
+            for (cmd, ts) in commands.iter() {
+                if seen.contains(cmd) { continue; }
+                seen.insert(cmd.clone());
+                if has_content { content.push_str(" · "); }
+                let elapsed = Self::format_duration(now.saturating_sub(*ts));
+                let label = if elapsed.is_empty() { cmd.clone() } else { format!("{} · {}", cmd, elapsed) };
+                let start = content.chars().count() + 1;
+                content.push_str(&label);
+                let end = content.chars().count() + 1;
+                segments.push((start, end, COLOR_ORANGE));
+                has_content = true;
+                shown += 1;
+                if shown >= 5 { break; }
+            }
+        }
+
+        // Fallback: show active_command from Zellij API (any session)
+        if !has_content {
+            if let SessionStatus::Running { active_command: Some(cmd), .. } = &project.status {
+                let start = content.chars().count() + 1;
+                content.push_str(cmd);
+                let end = content.chars().count() + 1;
+                segments.push((start, end, COLOR_ORANGE));
+                has_content = true;
+            }
         }
 
         // Tab count — only show when >1
@@ -826,6 +856,92 @@ layout {
         self.ai_last_duration.remove(session);
     }
 
+    /// Stale timeout from env (default 3600s = 60m). Shared by AI and shell state.
+    fn stale_timeout(&self) -> u64 {
+        std::env::var("SIDEBAR_STALE_TIMEOUT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3600)
+    }
+
+    /// Remove all shell tracking for a session.
+    fn evict_shell_session(&mut self, session: &str) {
+        self.shell_commands.remove(session);
+        self.shell_pane_count.remove(session);
+    }
+
+    fn load_shell_commands(&mut self) {
+        // Read per-pane files: <plugin /tmp>/sidebar-shell/<session>/<pane_id>.
+        // Format: "command timestamp". Same filesystem bridge as sidebar-ai.
+        let stale = self.stale_timeout();
+        let now = self.now_secs();
+
+        let dir = match std::fs::read_dir("/tmp/sidebar-shell") {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+
+        let mut sessions_seen = std::collections::BTreeSet::new();
+
+        for session_entry in dir.flatten() {
+            let session = match session_entry.file_name().to_str().map(|s| s.to_string()) {
+                Some(s) => s,
+                None => continue,
+            };
+            let path = session_entry.path();
+            if !path.is_dir() { continue; }
+
+            sessions_seen.insert(session.clone());
+
+            let panes = match std::fs::read_dir(&path) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+
+            let mut commands: Vec<(String, u64)> = Vec::new();
+            let mut active_count: usize = 0;
+
+            for pane_entry in panes.flatten() {
+                if let Ok(data) = std::fs::read_to_string(pane_entry.path()) {
+                    let parts: Vec<&str> = data.trim().split(' ').collect();
+                    if parts.len() < 2 { continue; }
+                    let cmd = parts[0].to_string();
+                    let ts = parts[1].parse::<u64>().unwrap_or(0);
+
+                    if ts > 0 && now.saturating_sub(ts) > stale {
+                        continue; // stale
+                    }
+
+                    commands.push((cmd, ts));
+                    active_count += 1;
+                }
+            }
+
+            if !commands.is_empty() {
+                // Sort by timestamp descending (most recent first)
+                commands.sort_by(|a, b| b.1.cmp(&a.1));
+                self.shell_commands.insert(session.clone(), commands);
+                if active_count > 0 {
+                    self.shell_pane_count.insert(session, active_count);
+                } else {
+                    self.shell_pane_count.remove(&session);
+                }
+            } else {
+                self.evict_shell_session(&session);
+            }
+        }
+
+        // Evict in-memory shell states with no backing file
+        let stale_shell: Vec<String> = self.shell_commands
+            .keys()
+            .filter(|s| !sessions_seen.contains(*s))
+            .cloned()
+            .collect();
+        for session in stale_shell {
+            self.evict_shell_session(&session);
+        }
+    }
+
     fn load_ai_states(&mut self) {
         // Read per-pane files: <plugin /tmp>/sidebar-ai/<session>/<pane_id>.
         // The plugin runs in a WASI sandbox where `/tmp` maps to the host's
@@ -840,9 +956,8 @@ layout {
         // Staleness is handled by SKIPPING, never deleting:
         //   - Session not currently known -> skip + evict in-memory (consistent
         //     every tick, so no flicker).
-        //   - Any turn older than STALE_SECS (crashed/killed session) -> skip the pane.
-        const STALE_SECS: u64 = 3600; // 60m
-
+        //   - Any turn older than stale timeout (crashed/killed session) -> skip the pane.
+        let stale = self.stale_timeout();
         let now = self.now_secs();
 
         let dir = match std::fs::read_dir("/tmp/sidebar-ai") {
@@ -895,7 +1010,7 @@ layout {
 
                     // Stale state (crashed/killed session, missed hook). Ignore the
                     // pane; the hook cleans the file on SessionEnd.
-                    if ts > 0 && now.saturating_sub(ts) > STALE_SECS {
+                    if ts > 0 && now.saturating_sub(ts) > stale {
                         continue;
                     }
 
@@ -964,7 +1079,7 @@ layout {
                 _ => return,
             };
             let ts = parts.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-            if ts > 0 && self.now_secs().saturating_sub(ts) > 3600 {
+            if ts > 0 && self.now_secs().saturating_sub(ts) > self.stale_timeout() {
                 return; // stale
             }
             self.ai_states.insert(session.to_string(), state);
@@ -1153,6 +1268,7 @@ impl ZellijPlugin for State {
         // Restore previous state instantly to avoid blank flash on load
         self.restore_snapshot();
         self.load_ai_states();
+        self.load_shell_commands();
 
         eprintln!("Plugin loaded, requesting permissions");
     }
@@ -1417,6 +1533,7 @@ impl ZellijPlugin for State {
                 const GIT_EVERY: usize = 7; // 7 * 1.5s ≈ 10.5s
 
                 self.load_ai_states();
+                self.load_shell_commands();
                 self.poll_tick += 1;
                 if self.pending_commands == 0
                     && (self.poll_tick == 1 || self.poll_tick % GIT_EVERY == 0)

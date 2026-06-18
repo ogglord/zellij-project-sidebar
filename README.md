@@ -1,6 +1,6 @@
 # zellij-project-sidebar
 
-A persistent sidebar plugin for [Zellij](https://zellij.dev) that shows your active project sessions at a glance. Click or keyboard-navigate to switch between projects, start new sessions, and see real-time AI agent activity across all sessions.
+A persistent sidebar plugin for [Zellij](https://zellij.dev) that shows your active project sessions at a glance. Click or keyboard-navigate to switch between projects, start new sessions, and see real-time AI agent and shell activity across all sessions.
 
 ![screenshot](screenshot.png)
 
@@ -8,16 +8,17 @@ A persistent sidebar plugin for [Zellij](https://zellij.dev) that shows your act
 
 Give this prompt to Claude Code (or your AI coding tool of choice) and it will handle everything:
 
-> Install the zellij-project-sidebar plugin from https://github.com/AndrewBeniston/zellij-project-sidebar. Clone the repo, build with `cargo build --target wasm32-wasip1 --release`, copy the .wasm to `~/.config/zellij/plugins/`. Then update my Zellij layout to include the sidebar with `scan_dir` pointing to my projects directory. Set up Claude Code hooks using the sidebar-status.sh script from the repo so the sidebar shows real-time AI activity indicators across all sessions (see the "AI activity indicators" section in the README for full setup). Also configure the attention system hooks for `sidebar::attention::` and `sidebar::clear::` pipe messages.
+> Install the zellij-project-sidebar plugin from https://github.com/AndrewBeniston/zellij-project-sidebar. Clone the repo, build with `cargo build --target wasm32-wasip1 --release`, copy the .wasm to `~/.config/zellij/plugins/`. Then update my Zellij layout to include the sidebar with `scan_dir` pointing to my projects directory. Set up Claude Code hooks using the sidebar-status.sh script from the repo so the sidebar shows real-time AI activity indicators across all sessions (see the "AI activity indicators" section in the README for full setup). Also configure the attention system hooks for `sidebar::attention::` and `sidebar::clear::` pipe messages. Set up shell activity tracking with `zellij-sidebar-init` so the sidebar shows foreground commands like `nvim` and `lazygit` in the detail line.
 
 ## Why?
 
-Zellij has great session management, but no ambient awareness. You can't see at a glance which projects are running, which session you're in, or which one has Claude Code actively working. This plugin gives you a docked sidebar that stays visible across tabs — an agentic AI dashboard for your terminal. Think VS Code's sidebar, but for terminal sessions with real-time AI visibility.
+Zellij has great session management, but no ambient awareness. You can't see at a glance which projects are running, which session you're in, or which one has Claude Code actively working. This plugin gives you a docked sidebar that stays visible across tabs — an agentic AI dashboard for your terminal. Think VS Code's sidebar, but for terminal sessions with real-time AI and shell visibility.
 
 ## Features
 
 - **AI activity at a glance**: see which sessions have Claude Code (or any AI tool) actively working, idle, or needing input — across all sessions, not just the current one
-- **Duration tracking**: shows how long Claude has been working (live timer), and how long the last turn took when idle
+- **Shell activity tracking**: see foreground commands (`nvim`, `lazygit`, `cargo build`) running in any session via shell hooks
+- **Duration tracking**: shows how long Claude has been working (live timer), and how long the last turn took when idle; shell commands also show duration
 - **Active sessions at a glance**: only shows projects with running or exited sessions, no clutter
 - **Current session highlighted**: green text shows you exactly where you are
 - **Browse mode**: press `/` to search all discovered projects and start new sessions
@@ -41,6 +42,15 @@ cp target/wasm32-wasip1/release/zellij-project-sidebar.wasm ~/.config/zellij/plu
 ```
 
 > Requires Rust with the `wasm32-wasip1` target: `rustup target add wasm32-wasip1`
+
+### Build the init binary
+
+The shell activity hook requires the `zellij-sidebar-init` binary:
+
+```bash
+cargo build --release --bin zellij-sidebar-init
+cp target/release/zellij-sidebar-init ~/.local/bin/
+```
 
 ## Configuration
 
@@ -129,7 +139,7 @@ plugin location="file:~/.config/zellij/plugins/zellij-project-sidebar.wasm" {
 | `·` | Orange | Exited (resurrectable) session |
 | `·` | Cyan | Not started |
 
-The current session's name is highlighted in green. Sessions with AI activity show a detail line with "claude" and duration info (e.g. `claude · 30s` while working, `claude · took 2m` when done).
+The current session's name is highlighted in green. Sessions with AI activity show a detail line with "claude" and duration info (e.g. `claude · 30s` while working, `claude · took 2m` when done). Sessions with shell activity show commands like `nvim · 5m` or `lazygit · 10m`.
 
 ## Attention system
 
@@ -145,6 +155,61 @@ zellij pipe --name "sidebar::clear::session-name"
 
 Attention is automatically cleared when you switch to a session via the sidebar.
 
+## Shell activity tracking
+
+The sidebar can show foreground commands running in any session — `nvim`, `lazygit`, `cargo build`, etc. This is powered by a shell hook that writes to a shared filesystem, just like the AI hooks.
+
+### How it works
+
+Shell command state is shared via per-pane files under `$TMPDIR/zellij-<uid>/sidebar-shell/<session>/<pane_id>`. The format is `command_name timestamp`. The plugin reads these files on the same ~1.5s timer as the AI state.
+
+### Setup with `zellij-sidebar-init`
+
+The `zellij-sidebar-init` binary generates shell hook code that chains with your existing `preexec`/`precmd` hooks (same pattern as direnv, starship, zoxide, and atuin):
+
+**Zsh:**
+
+```bash
+eval "$(zellij-sidebar-init hook zsh)"
+```
+
+Add to `~/.zshrc` (or use the NixOS module below).
+
+**Bash:**
+
+```bash
+eval "$(zellij-sidebar-init hook bash)"
+```
+
+Add to `~/.bashrc` (or use the NixOS module below).
+
+The generated hooks:
+- Write the current command's basename to the shared directory on execution
+- Remove the file when the command finishes (returning to prompt)
+- Strip NixOS wrapper prefixes (`__nvim-wrapped` → `nvim`)
+- Chain with existing hooks so they don't clobber each other
+
+### NixOS / Home Manager
+
+A NixOS module is provided in `nix/module.nix`. Add it to your Home Manager configuration:
+
+```nix
+{ config, pkgs, ... }:
+
+{
+  imports = [ ./path/to/nix/module.nix ];
+
+  programs.zellij.project-sidebar = {
+    enable = true;
+    enableZshIntegration = true;
+    enableBashIntegration = false;
+    staleTimeout = 3600; # 60 minutes
+  };
+}
+```
+
+This injects the `eval "$(zellij-sidebar-init hook ...)` line into your shell config and sets the `SIDEBAR_STALE_TIMEOUT` environment variable.
+
 ## AI activity indicators
 
 The sidebar shows real-time AI agent activity across all your Zellij sessions. When Claude Code (or any AI tool) is working in a session, you'll see it at a glance without switching sessions.
@@ -153,7 +218,15 @@ The sidebar shows real-time AI agent activity across all your Zellij sessions. W
 
 AI state is shared across all sessions via per-pane files under `$TMPDIR/zellij-<uid>/sidebar-ai/<session>/<pane_id>`. The plugin runs in a WASI sandbox where its `/tmp` maps to the host's `$TMPDIR/zellij-<uid>/`, so the hook writes there (not host `/tmp`). Each sidebar instance reads these files on a ~10-second timer, so cross-session state appears within seconds. Pipe messages provide instant updates for the current session.
 
-The plugin self-heals stale state without deleting shared files (multiple instances read them concurrently): a session no longer present in Zellij is dropped from the display, and an `active` turn older than 60 minutes that never received a `Stop` (pane killed / agent crashed) is ignored. Register the `SessionEnd` hook (below) so a clean exit removes its state file immediately.
+### Stale timeout
+
+Both AI and shell state share the same stale timeout, controlled by the `SIDEBAR_STALE_TIMEOUT` environment variable (seconds, default `3600` = 60 minutes):
+
+```bash
+export SIDEBAR_STALE_TIMEOUT=900  # 15 minutes
+```
+
+A state file older than this timeout is ignored (crashed/killed process, missed cleanup). The hooks themselves remove the file on clean exit, so stale files are the exception.
 
 ### Setting up Claude Code hooks
 

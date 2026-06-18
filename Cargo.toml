@@ -3,6 +3,14 @@ name = "zellij-project-sidebar"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "zellij-project-sidebar"
+path = "src/main.rs"
+
+[[bin]]
+name = "zellij-sidebar-init"
+path = "src/bin/init.rs"
+
 [dependencies]
 zellij-tile = "0.44.0"
 serde = { version = "1.0", features = ["derive"] }
